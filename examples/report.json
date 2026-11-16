@@ -1,0 +1,28 @@
+{
+  "payload": {
+    "version": 1,
+    "genesis_hash": "0xabababababababababababababababababababababababababababababababab",
+    "netuid": 42,
+    "start_block": 100,
+    "end_block": 200,
+    "end_block_hash": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "miners": [
+      {
+        "hotkey": "miner-b",
+        "registered_at": 55,
+        "accepted_work": 300
+      },
+      {
+        "hotkey": "miner-a",
+        "registered_at": 40,
+        "accepted_work": 700
+      },
+      {
+        "hotkey": "miner-c",
+        "registered_at": 125,
+        "accepted_work": 0
+      }
+    ]
+  },
+  "signature": "62a78bb06331f008461ff52a36fbe4212828ff5b1f4246d116493564c94d38a851f58d9e099877e7b4c455557117df2b671a69f7779e4a5a9abc472f5a639e0a"
+}

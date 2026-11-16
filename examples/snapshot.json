@@ -1,0 +1,23 @@
+{
+  "genesis_hash": "0xabababababababababababababababababababababababababababababababab",
+  "netuid": 42,
+  "block": 200,
+  "block_hash": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "miners": [
+    {
+      "uid": 12,
+      "hotkey": "miner-b",
+      "registered_at": 55
+    },
+    {
+      "uid": 15,
+      "hotkey": "miner-c",
+      "registered_at": 125
+    },
+    {
+      "uid": 7,
+      "hotkey": "miner-a",
+      "registered_at": 40
+    }
+  ]
+}

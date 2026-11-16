@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-subnet"
+version = "0.1.0"
+description = "Signed-report validator for a Bittensor GPU subnet"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["cryptography==50.0.2"]
+
+[project.optional-dependencies]
+chain = ["bittensor==11.3.2"]
+
+[project.scripts]
+gpu-subnet-validate = "gpu_subnet.__main__:main"
+gpu-subnet-chain = "gpu_subnet.chain:main"
+gpu-subnet-scores = "gpu_subnet.scores:main"
+
+[tool.setuptools.packages.find]
+include = ["gpu_subnet"]
