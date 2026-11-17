@@ -1,10 +1,19 @@
 # GPU subnet validator
 
-The subnet rewards miners for TensorCash work credited by the Bob Labs pool. Miners run the Bob Labs package and connect to the pool over an outbound WebSocket. This repository contains the validator. It verifies the pool's signed scores, maps eligible hotkeys to Bittensor UIDs, and prepares weights.
+The subnet is designed to reward miners for verified TensorCash work credited by the Bob Labs pool. Miners run the Bob Labs package and connect to the pool over an outbound WebSocket. The same GPUs can also serve customer inference requests through the pool.
 
-The Bob Labs report path supports offline replay and read-only Bittensor weight planning. The original block-anchored prototype has its own report format and submission workflow. The report and roster in `examples/` are synthetic prototype inputs.
+## Paid inference
 
-Run the examples from the project directory with Python 3.11 or newer and `uv` installed.
+Paid inference means customers pay to send prompts to a model and receive responses. Bob Labs' design lets the pool send those prompts to the same rigs over their existing WebSocket connections.
+
+## Project status
+
+- **Built in this repo.** The validator fetches and verifies signed Bob Labs scores, maps eligible hotkeys to Bittensor UIDs, and prepares unsigned weight plans. Saved reports can be replayed offline. The original block-anchored prototype has its own report format and submission workflow.
+- **Still planned.** Connect Bob Labs reports to the guarded weight submission workflow and add automatic polling. For paid inference, the subnet team still needs to build the customer-facing listing or API and set up pricing, usage metering, and billing.
+
+The current weight formula uses verified TensorCash work and the reported invalid-work rate. Bob Labs' report schema includes inference metrics such as successful and failed requests, time to first token, and tokens per second. Using those metrics for Bittensor rewards would be a separate scoring decision.
+
+The report and roster in `examples/` are synthetic prototype inputs. Run the examples from the project directory with Python 3.11 or newer and `uv` installed.
 
 ## Bob Labs scores
 
