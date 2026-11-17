@@ -9,7 +9,7 @@ U16_MAX = (1 << 16) - 1
 _U64_MAX = (1 << 64) - 1
 
 
-def encode_weights(weights: dict[int, int], cap: int) -> dict[int, int]:
+def encode_weights(weights: dict[int, int] | dict[int, Fraction], cap: int) -> dict[int, int]:
     """Clip positive work to a common threshold and encode it as max-scaled u16."""
     if type(cap) is not int or not 0 <= cap <= U16_MAX:
         raise ChainError("chain returned an invalid maximum weight limit")
@@ -17,8 +17,12 @@ def encode_weights(weights: dict[int, int], cap: int) -> dict[int, int]:
         raise ChainError("there is no positive eligible work to submit")
     if any(type(uid) is not int or not 0 <= uid <= U16_MAX for uid in weights):
         raise ChainError("weight destinations must be unsigned 16-bit UIDs")
-    if any(type(work) is not int or not 1 <= work <= _U64_MAX for work in weights.values()):
-        raise ChainError("relative work must contain only positive unsigned 64-bit integers")
+    for work in weights.values():
+        if type(work) is int and 1 <= work <= _U64_MAX:
+            continue
+        if isinstance(work, Fraction) and work > 0:
+            continue
+        raise ChainError("relative work must contain positive u64 integers or exact fractions")
     if len(weights) * cap < U16_MAX:
         raise ChainError(
             "too few positive eligible miners to satisfy the subnet's maximum weight limit"

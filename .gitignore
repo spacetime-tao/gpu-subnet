@@ -7,10 +7,14 @@ dist/
 .DS_Store
 .env
 .env.*
+prod.conf
+.tsc-subnet/
+bind_token
 wallets/
 captures/
 scores-capture*.json
 .scores-capture-*
+roster-private*.json
 *.sqlite
 *.sqlite-*
 *.sqlite3

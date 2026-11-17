@@ -1,6 +1,7 @@
 """Build and send Bittensor weight intents using the pinned SDK."""
 
 import asyncio
+from fractions import Fraction
 
 from .roster import ChainError
 from .uid_guard import guard_broadcast
@@ -13,7 +14,8 @@ _WATCH_CLEANUP_SECONDS = 2
 
 
 async def prepare_submission(
-    sdk, client, wallet, *, netuid: int, weights: dict[int, int], version_key: int
+    sdk, client, wallet, *, netuid: int, weights: dict[int, int] | dict[int, Fraction],
+    version_key: int,
 ):
     """Check the requested weight vector and quote its unsigned transaction."""
     if type(netuid) is not int or not 1 <= netuid <= U16_MAX:

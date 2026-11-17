@@ -4,13 +4,22 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 
+from .bob_scores import (
+    DEFAULT_WINDOW_SECONDS,
+    BobReport,
+    load_bob_report,
+    normalized_weights,
+    preview_bob_weights,
+)
 from .evidence import MAX_INPUT_BYTES, WorkReport, load_report, read_bounded
 from .journal import SubmissionJournal
 from .readback import reconcile_submission
 from .roster import ChainError, Roster, read_roster
+from .scores_capture import load_capture
 from .submission import prepare_submission, submit_weights
 from .uid_guard import make_guarded_client
 from .weights import MinerSlot, preview_weights
@@ -192,7 +201,54 @@ async def _audit_inclusion_roster(sdk, client, netuid, genesis_hash, block_hash,
     }
 
 
-async def _run_command(sdk, args: argparse.Namespace, report: WorkReport | None) -> dict:
+async def preview_bob_chain(
+    sdk, client, wallet, report: BobReport, *, netuid: int, max_report_age_seconds: int,
+    version_key: int = 0, now: int | None = None,
+) -> dict:
+    """Plan an unsigned transaction using timestamped pool data and the current roster."""
+    if report.netuid != netuid:
+        raise ChainError("the scores report is for a different subnet than the one selected")
+    if type(max_report_age_seconds) is not int or max_report_age_seconds < 0:
+        raise ChainError("maximum report age must be a non-negative number of seconds")
+    if now is None:
+        now = int(time.time())
+    age = now - report.end_ts
+    if age < 0:
+        raise ChainError("the scores report ends in the future")
+    if age > max_report_age_seconds:
+        raise ChainError("the scores report is older than the configured maximum age")
+
+    roster = await read_roster(client, netuid, finalized=False)
+    validator_hotkey = sdk.public_view(wallet, "hotkey").ss58_address
+    if validator_hotkey not in roster.validator_hotkeys:
+        raise ChainError("the selected hotkey has no validator permit on this subnet")
+    snapshot = roster.snapshot
+    weights = preview_bob_weights(report, snapshot, validator_hotkey=validator_hotkey)
+    receipt = {
+        "status": "preview_ready" if weights else "no_eligible_work",
+        "scoring_policy": "bob_labs_work_v1",
+        "genesis_hash": snapshot.genesis_hash,
+        "netuid": netuid,
+        "validator_hotkey": validator_hotkey,
+        "start_ts": report.start_ts,
+        "end_ts": report.end_ts,
+        "report_digest": report.digest,
+        "roster_block": snapshot.block,
+        "roster_block_hash": snapshot.block_hash,
+        "targets": [asdict(slot) for slot in snapshot.miners if slot.uid in weights],
+        "normalized_weights": normalized_weights(weights),
+    }
+    if weights:
+        _, plan = await prepare_submission(
+            sdk, client, wallet, netuid=netuid, weights=weights, version_key=version_key,
+        )
+        if plan.get("signer_address") != validator_hotkey:
+            raise ChainError("the SDK plan signer differs from the selected validator hotkey")
+        receipt["plan"] = plan
+    return receipt
+
+
+async def _run_command(sdk, args: argparse.Namespace, report: WorkReport | BobReport | None) -> dict:
     if args.command == "reconcile":
         journal = _open_journal(args.journal)
         entry = journal.get(args.tx_hash)
@@ -220,6 +276,11 @@ async def _run_command(sdk, args: argparse.Namespace, report: WorkReport | None)
             }
 
         wallet = sdk.Wallet(name=args.wallet, hotkey=args.hotkey)
+        if args.command == "bob-weights":
+            return await preview_bob_chain(
+                sdk, client, wallet, report, netuid=args.netuid,
+                max_report_age_seconds=args.max_report_age_seconds, version_key=args.version_key,
+            )
         journal = _open_journal(args.journal, create=True) if args.submit else None
         return await run_weights(
             sdk,
@@ -264,6 +325,17 @@ def main(argv: list[str] | None = None) -> int:
     weights.add_argument("--submit", action="store_true", help="sign and submit the weight intent")
     weights.add_argument("--journal", type=Path, default=_DEFAULT_JOURNAL, help="private SQLite file")
 
+    bob_weights = subcommands.add_parser("bob-weights", help="plan unsigned weights from a Bob Labs report")
+    bob_source = bob_weights.add_mutually_exclusive_group(required=True)
+    bob_source.add_argument("--report", type=Path, help="Bob Labs scores envelope JSON")
+    bob_source.add_argument("--capture", type=Path, help="saved Bob Labs scores response")
+    bob_weights.add_argument("--pool-public-key", type=Path, required=True, help="trusted pool key file")
+    bob_weights.add_argument("--window-seconds", type=int, default=DEFAULT_WINDOW_SECONDS)
+    bob_weights.add_argument("--max-report-age-seconds", type=int, required=True)
+    bob_weights.add_argument("--wallet", required=True, help="validator wallet name")
+    bob_weights.add_argument("--hotkey", required=True, help="validator hotkey name within the wallet")
+    bob_weights.add_argument("--version-key", type=int, default=0, help="subnet scoring version key")
+
     reconcile = subcommands.add_parser("reconcile", help="read back a recorded transaction")
     reconcile.add_argument("--tx-hash", required=True, help="hash of the signed transaction")
     reconcile.add_argument("--journal", type=Path, default=_DEFAULT_JOURNAL, help="private SQLite file")
@@ -303,6 +375,14 @@ def main(argv: list[str] | None = None) -> int:
             report = load_report(read_bounded(args.report, MAX_INPUT_BYTES), key)
             if report.netuid != args.netuid:
                 raise ChainError("the report is for a different subnet than the one selected")
+        elif args.command == "bob-weights":
+            key = read_bounded(args.pool_public_key, 80).decode("ascii").rstrip("\r\n")
+            raw = (
+                load_capture(args.capture).body
+                if args.capture is not None
+                else read_bounded(args.report, MAX_INPUT_BYTES)
+            )
+            report = load_bob_report(raw, key, netuid=args.netuid, window_seconds=args.window_seconds)
         receipt = asyncio.run(_run_command(sdk, args, report))
     except (OSError, ValueError, sdk.BittensorError) as error:
         print(f"Chain command failed: {error}", file=sys.stderr)

@@ -1,10 +1,79 @@
 # GPU subnet validator
 
-The validator turns a signed pool report into relative work totals by Bittensor UID. It supports offline replay and an optional Bittensor connection for roster reads, transaction previews, and explicit weight submission. The scores command captures HTTP responses for later verification. The snapshot and report in `examples/` are synthetic.
+The subnet rewards miners for TensorCash work credited by the Bob Labs pool. Miners run the Bob Labs package and connect to the pool over an outbound WebSocket. This repository contains the validator. It verifies the pool's signed scores, maps eligible hotkeys to Bittensor UIDs, and prepares weights.
 
-## Run the example
+The Bob Labs report path supports offline replay and read-only Bittensor weight planning. The original block-anchored prototype has its own report format and submission workflow. The report and roster in `examples/` are synthetic prototype inputs.
 
-From the project directory with Python 3.11 or newer and `uv` installed:
+Run the examples from the project directory with Python 3.11 or newer and `uv` installed.
+
+## Bob Labs scores
+
+The validator checks the pinned Ed25519 key and verifies the signature over the exact UTF-8 bytes in the envelope's `report` string before parsing it. It checks the schema version, subnet number, and Unix-second window. The default window is 86,400 seconds. The scoring rule uses `verified_work * (1 - invalid_rate)`. The two inputs support up to six decimal places. Work must be nonnegative and at most the unsigned 64-bit maximum. The invalid rate must be between zero and one. The pool's credited work already excludes shares it zeroed after audit. The validator matches miner hotkeys against the selected roster, excludes the subnet owner, drops normalized shares strictly below 0.0001, and renormalizes the remaining scores. The signature authenticates the pool's accounting. Independent share verification would require separate proof and attribution data.
+
+### Capture a response
+
+Set `API_BASE` to the HTTPS base URL supplied by Bob Labs. Set `SUBNET_NETUID` to the agreed subnet number and load `SCORES_TOKEN` into the environment through your secret store. Save the pool's public key in `pool-public-key.hex` in the private directory below after confirming the key with Bob Labs through a separate trusted channel. The key file contains the 32-byte key as hex.
+
+```sh
+umask 077
+gpu_subnet_dir="$HOME/.local/state/gpu-subnet"
+mkdir -p -m 700 "$gpu_subnet_dir/captures"
+scores_capture_path="$gpu_subnet_dir/captures/scores-capture-$(date -u +%Y%m%dT%H%M%SZ).json"
+
+uv run gpu-subnet-scores capture \
+  --api-base "$API_BASE" --netuid "$SUBNET_NETUID" --window-seconds 86400 \
+  --output "$scores_capture_path"
+uv run gpu-subnet-scores inspect --input "$scores_capture_path"
+```
+
+`--api-base` makes one HTTPS GET to `/subnet/scores` with the subnet number and window in the query and uses `SCORES_TOKEN` as a bearer credential. The generic `--url` mode takes a full HTTPS URL with its query parameters and supports `--header-env Header-Name=ENV_VAR` to load a request header from the environment. Use a fresh filename for each capture.
+
+The capture stores the response body and ordered header pairs. Redirects, HTTP errors, malformed response framing, and unsupported transfer encodings fail the capture. Valid HTTP trailers are stored separately in capture format version 2. Responses without trailers use version 1. Both commands label the file `unverified_capture`. The offline `inspect` command prints its status, body size and digest, and header names.
+
+### Replay a signed report offline
+
+Use a trusted finalized roster snapshot for the report you are reviewing. The `roster` command exports the owner hotkey required by this path. Save its JSON outside the repository with the original signed report or capture and the pinned key used for that report.
+
+```sh
+uv run gpu-subnet-validate --format bob-v1 \
+  --capture "$scores_capture_path" \
+  --snapshot "$gpu_subnet_dir/roster-private.json" \
+  --pool-public-key "$gpu_subnet_dir/pool-public-key.hex" \
+  --window-seconds 86400
+```
+
+Use `--report "$REPORT_PATH"` in place of `--capture` if you have the signed envelope JSON. Historical replay uses the recorded scoring window. Pass `--validator-hotkey "$VALIDATOR_HOTKEY_SS58"` to mirror the chain planner's exclusion of the selected validator.
+
+### Preview Bittensor weights
+
+Set `BITTENSOR_NETWORK` to the intended chain name or WebSocket URL. Set `REPORT_MAX_AGE_SECONDS` to the maximum age you will accept between the signed window end and the local clock. The planner rejects timestamps in the future. Use the wallet and hotkey names of a registered validator with a permit.
+
+```sh
+uv run --extra chain gpu-subnet-chain \
+  --network "$BITTENSOR_NETWORK" --netuid "$SUBNET_NETUID" bob-weights \
+  --capture "$scores_capture_path" \
+  --pool-public-key "$gpu_subnet_dir/pool-public-key.hex" \
+  --window-seconds 86400 --max-report-age-seconds "$REPORT_MAX_AGE_SECONDS" \
+  --wallet "$VALIDATOR_WALLET" --hotkey "$VALIDATOR_HOTKEY"
+```
+
+`bob-weights` uses the roster at the current best block and pins the read to that block hash. It excludes the selected validator as well as the subnet owner and outputs an unsigned plan. Use `--report` for a signed envelope JSON and `--version-key` when the subnet requires a version key above the default of `0`. Bob Labs submission and automated polling are pending.
+
+## Miner setup
+
+Each rig needs an RTX 5090, the Bob Labs package with the engine and weights, and a hotkey registered on the subnet. Install the package, obtain a per-worker challenge using Bob Labs' `hotkey_bind` tool, sign it with the registered hotkey using `btcli wallet sign --use-hotkey`, and exchange the signed challenge for a bind token. Keep the signing key with the wallet. Configure the Bob Labs service with the pool WebSocket URL, a unique worker ID, the bind token or its file path, and the shared join token. The installer supplies the systemd service. The miner needs no inbound port or Bittensor axon.
+
+The join token opens the pool connection. The per-worker bind token links that worker's scores to the registered hotkey. Bob Labs' handoff marked bind-token handling in the miner's initial `HELLO` as pending. Ask Bob Labs which release supports it and what mapping they will use for pilot rigs if it is still pending.
+
+## Pilot dependencies
+
+- Get the scores base URL and bearer token, the pinned public key and its rotation procedure, and a representative signed scores fixture with its verification key. Confirm how the pool issues corrected reports and represents an empty window.
+- Get the pool WebSocket URL and join token, the release-matched miner installer and bind tool, and the reference validator and owner bootstrap for review. Keep vendor materials and all real credentials, captures, wallet files, and submission journals outside the repository.
+- Agree on the chain, subnet number, signing-key scope, acceptable report age, cadence, and scoring policy. The signed Bob Labs report includes a netuid and a timestamp window. Establish how the signing key is scoped to the intended chain and how the report window is aligned with finalized registrations, including work from a hotkey that re-registers during a window.
+- Review Bob Labs' suggested starting settings of a 360-block tempo, at least 24 hours of immunity, up to 256 UIDs, and commit-reveal initially off. Check the subnet's weight rate limit and minimum destinations against the planned validator cadence and pilot roster.
+- Before Bob Labs submissions, extend the submission journal to order and deduplicate the signed timestamp windows even when a report is reissued with a different digest. Confirm retry rules, subnet weight settings, and operator procedures before a separately authorized pilot.
+
+## Run the offline prototype example
 
 ```sh
 uv run gpu-subnet-validate \
@@ -27,16 +96,20 @@ GPU_SUBNET_REQUIRE_SDK_CHECK=1 uv run --extra chain \
   python -m unittest discover -s tests -p 'test_sdk_decoder.py' -v
 ```
 
-## Bittensor connection
+## Bittensor roster and prototype weights
 
-The `chain` extra pins Bittensor SDK 11.3.2. Set `BITTENSOR_NETWORK` to the intended chain name or websocket URL and `SUBNET_NETUID` to its subnet number. The roster command takes the latest finalized roster by default. Use `--block` to read a specific finalized snapshot. The JSON includes all registered slots and lists hotkeys with validator permits separately. Save the output at the report's end block to use it as `--snapshot` for offline replay.
+The `chain` extra pins Bittensor SDK 11.3.2. Set `BITTENSOR_NETWORK` to the intended chain name or WebSocket URL and `SUBNET_NETUID` to its subnet number. The roster command takes the latest finalized roster by default. Use `--block` to read a specific finalized snapshot. The JSON includes the owner hotkey, all registered slots, and a separate list of hotkeys with validator permits. For prototype replay, save the roster at the signed report's end block.
 
 ```sh
+umask 077
+gpu_subnet_dir="$HOME/.local/state/gpu-subnet"
+mkdir -p -m 700 "$gpu_subnet_dir"
 uv run --extra chain gpu-subnet-chain \
-  --network "$BITTENSOR_NETWORK" --netuid "$SUBNET_NETUID" roster
+  --network "$BITTENSOR_NETWORK" --netuid "$SUBNET_NETUID" roster \
+  > "$gpu_subnet_dir/roster-private.json"
 ```
 
-The weights command uses a signed report file with a real finalized block anchor on the selected chain. Set the window width and maximum acceptable age in blocks for the scoring policy. Use the wallet and hotkey names of a registered validator with a permit.
+The prototype `weights` command uses a signed prototype report with a real finalized block anchor on the selected chain. Set the window width and maximum acceptable age in blocks for the scoring policy. Use the wallet and hotkey names of a registered validator with a permit.
 
 ```sh
 uv run --extra chain gpu-subnet-chain \
@@ -72,22 +145,6 @@ Submission pins the real-time checks and signing to the selected RPC endpoint so
 
 Historical transaction lookup uses the SDK's configured archive endpoints for exact block hashes when the block body is unavailable or the primary reports pruned state. For a custom endpoint without a configured archive, use an archive-capable endpoint to reconcile older attempts. If a later readback disputes previously observed inclusion or a successful receipt, the journal flags the conflict and blocks retries for that window. Only a proven dispatch failure or a complete finalized search showing expiration permits a retry of the latest reserved window. Epoch rewards require a separate check.
 
-## Scores API capture
-
-Once the pool provides the endpoint and request parameters, set `SCORES_URL` to the full HTTPS URL. `capture` performs one GET and saves the response body and ordered header pairs. The example stores captures in a private directory outside the repository. When the pool documents a credential header, use `--header-env Header-Name=ENV_VAR` to load its value from the environment. Redirects, HTTP errors, malformed response framing, and unsupported transfer encodings fail the capture. Valid HTTP trailers are saved separately from headers in capture format version 2. Responses without trailers use version 1.
-
-```sh
-scores_capture_dir="$HOME/.local/state/gpu-subnet/captures"
-mkdir -p -m 700 "$scores_capture_dir"
-scores_capture_path="$scores_capture_dir/scores-capture.json"
-uv run gpu-subnet-scores capture --url "$SCORES_URL" --output "$scores_capture_path"
-uv run gpu-subnet-scores inspect --input "$scores_capture_path"
-```
-
-`inspect` runs offline and prints the status, body size and digest, and header names. Both commands label the response `unverified_capture`. Use a fresh filename for each capture.
-
-For a capture containing a signed report in the prototype format below, replace `--report examples/report.json` in the offline example above with `--capture "$scores_capture_path"`. The verification key, roster snapshot, and expected window width are still required. Bob Labs' signature, window, and accounting rules are needed to use their format for scoring.
-
 ## Prototype input contract
 
 The report envelope contains `payload` and `signature`. The payload binds the schema version, chain genesis hash, netuid, and half-open block window `[start_block, end_block)`. The separately trusted snapshot is pinned at `end_block`, and its block hash must match `end_block_hash` in the report. The configured window size must equal the reported width.
@@ -96,4 +153,4 @@ The signature is lowercase hex Ed25519 over the payload serialized as UTF-8 JSON
 
 Each report row contains a hotkey, its registration block, and a non-negative integer amount of accepted work. The preview assigns each positive amount to the corresponding eligible UID in the snapshot, provided the same registration was active before the window ended. The receipt's `weights` field holds raw relative scores. The chain plan lists the capped integer vector under `encoded_weights`.
 
-The input contract and the accepted-work scoring rule are prototype choices. A valid signature authenticates the pool's totals. Share-level verification requires proof material and attribution receipts. To integrate Bob Labs, the next inputs are their actual report signature format, work-unit definition, and a sample report with its share evidence.
+For a capture containing a signed prototype report, replace `--report examples/report.json` in the offline example with `--capture "$scores_capture_path"`. Use the trusted verification key, the matching roster snapshot, and the expected block window.

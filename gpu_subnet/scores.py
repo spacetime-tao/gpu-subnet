@@ -7,6 +7,7 @@ import re
 import sys
 from pathlib import Path
 
+from .bob_scores import DEFAULT_WINDOW_SECONDS, fetch_bob_scores
 from .scores_capture import load_capture, save_capture
 from .scores_http import fetch_scores
 
@@ -32,7 +33,11 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
 
     capture = commands.add_parser("capture", help="fetch and save one response over HTTPS")
-    capture.add_argument("--url", required=True, help="full scores API URL with query parameters")
+    endpoint = capture.add_mutually_exclusive_group(required=True)
+    endpoint.add_argument("--url", help="full scores API URL with query parameters")
+    endpoint.add_argument("--api-base", help="Bob Labs HTTPS origin; uses SCORES_TOKEN")
+    capture.add_argument("--netuid", type=int, help="Bittensor subnet for the Bob Labs report")
+    capture.add_argument("--window-seconds", type=int, help="Bob Labs window (default 86400)")
     capture.add_argument("--output", type=Path, required=True, help="new capture file")
     capture.add_argument("--header-env", action="append", default=[], metavar="HEADER=ENV_VAR")
     capture.add_argument("--timeout", type=float, default=30.0, help="socket timeout in seconds")
@@ -47,8 +52,21 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("output capture already exists")
             if not args.output.parent.is_dir():
                 raise ValueError("output directory must exist")
-            headers = _request_headers(args.header_env)
-            response = fetch_scores(args.url, headers=headers or None, timeout=args.timeout)
+            if args.api_base is not None:
+                if args.netuid is None or args.header_env:
+                    raise ValueError("--api-base requires --netuid and takes SCORES_TOKEN from the environment")
+                response = fetch_bob_scores(
+                    args.api_base, os.environ.get("SCORES_TOKEN", ""), netuid=args.netuid,
+                    window_seconds=(
+                        DEFAULT_WINDOW_SECONDS if args.window_seconds is None else args.window_seconds
+                    ),
+                    timeout=args.timeout,
+                )
+            else:
+                if args.netuid is not None or args.window_seconds is not None:
+                    raise ValueError("--netuid and --window-seconds require --api-base")
+                headers = _request_headers(args.header_env)
+                response = fetch_scores(args.url, headers=headers or None, timeout=args.timeout)
             save_capture(args.output, response)
         else:
             response = load_capture(args.input)

@@ -175,6 +175,7 @@ class SdkDecoderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["observed_weights"], ENCODED_WEIGHTS)
         roster = await read_roster(client, NETUID, block=INCLUSION)
         self.assertEqual(roster.validator_hotkeys, {HOTKEYS[0]})
+        self.assertEqual(roster.snapshot.owner_hotkey, HOTKEYS[0])
         self.assertEqual(
             [(slot.uid, slot.hotkey, slot.registered_at) for slot in roster.snapshot.miners],
             list(zip(range(3), HOTKEYS, REGISTRATIONS)),

@@ -31,6 +31,7 @@ class ChainSnapshot:
     block: int
     block_hash: str
     miners: tuple[MinerSlot, ...]
+    owner_hotkey: str | None = None
 
 
 def load_snapshot(raw: bytes) -> ChainSnapshot:
@@ -38,13 +39,16 @@ def load_snapshot(raw: bytes) -> ChainSnapshot:
     try:
         data = _read_json(raw)
         fields = {"genesis_hash", "netuid", "block", "block_hash", "miners"}
-        if isinstance(data, dict) and "validator_hotkeys" in data:
-            fields.add("validator_hotkeys")
+        if isinstance(data, dict):
+            fields.update(data.keys() & {"owner_hotkey", "validator_hotkeys"})
         snapshot = _fields(data, fields, label="snapshot")
         genesis_hash = _chain_hash(snapshot["genesis_hash"], label="genesis_hash")
         netuid = _uint(snapshot["netuid"], 16, label="netuid")
         block = _uint(snapshot["block"], 32, label="block")
         block_hash = _chain_hash(snapshot["block_hash"], label="block_hash")
+        owner_hotkey = snapshot.get("owner_hotkey")
+        if owner_hotkey is not None:
+            owner_hotkey = _hotkey(owner_hotkey)
         rows = snapshot["miners"]
         if not isinstance(rows, list) or len(rows) > 65_536:
             raise WeightError("snapshot miners must be an array of at most 65536 rows")
@@ -76,7 +80,7 @@ def load_snapshot(raw: bytes) -> ChainSnapshot:
     except ReportError as error:
         raise WeightError(f"invalid snapshot: {error}") from error
 
-    return ChainSnapshot(genesis_hash, netuid, block, block_hash, tuple(miners))
+    return ChainSnapshot(genesis_hash, netuid, block, block_hash, tuple(miners), owner_hotkey)
 
 
 def preview_weights(

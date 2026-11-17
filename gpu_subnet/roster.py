@@ -54,6 +54,9 @@ async def read_roster(
         if graph_netuid != netuid or (block is not None and graph_block != block):
             raise ChainError("metagraph does not match the requested subnet and block")
         block = graph_block
+        owner_hotkey = graph.get("owner_hotkey")
+        if owner_hotkey is not None:
+            owner_hotkey = _hotkey(owner_hotkey)
 
         count = _uint(graph.get("num_uids"), 16, label="metagraph UID count")
         hotkeys = graph.get("hotkeys")
@@ -83,5 +86,5 @@ async def read_roster(
     except ReportError as error:
         raise ChainError(str(error)) from error
 
-    snapshot = ChainSnapshot(genesis_hash, netuid, block, block_hash, tuple(slots))
+    snapshot = ChainSnapshot(genesis_hash, netuid, block, block_hash, tuple(slots), owner_hotkey)
     return Roster(snapshot, frozenset(validator_hotkeys))
