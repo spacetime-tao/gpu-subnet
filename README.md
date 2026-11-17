@@ -4,12 +4,12 @@ The subnet is designed to reward miners for verified TensorCash work credited by
 
 ## Paid inference
 
-Paid inference means customers pay to send prompts to a model and receive responses. Bob Labs' design lets the pool send those prompts to the same rigs over their existing WebSocket connections.
+Paid inference means customers pay to send prompts to a model and receive responses. Bob Labs' design routes requests from a customer listing through its OpenAI-compatible inference gateway and pool to the rigs over their existing WebSocket connections. Bob Labs operates the serving infrastructure. The subnet team owns the listing, pricing, and billing. The first listing still needs its gateway connection details and a way to reconcile customer usage and charges.
 
 ## Project status
 
-- **Built in this repo.** The validator fetches and verifies signed Bob Labs scores, maps eligible hotkeys to Bittensor UIDs, and prepares unsigned weight plans. Saved reports can be replayed offline. The original block-anchored prototype has its own report format and submission workflow.
-- **Still planned.** Connect Bob Labs reports to the guarded weight submission workflow and add automatic polling. For paid inference, the subnet team still needs to build the customer-facing listing or API and set up pricing, usage metering, and billing.
+- **Built in this repo.** The validator fetches and verifies signed Bob Labs scores, maps eligible hotkeys to Bittensor UIDs, and prepares unsigned weight plans. Saved reports can be replayed offline. The Bob Labs commands support cadence-based polling and explicitly enabled weight submissions with a private journal and chain readback. The original block-anchored prototype has its own report format.
+- **Still open.** Connect to the pilot pool, confirm the operator settings and report attribution policy, and verify the path from a bound rig to on-chain weights. For paid inference, connect the first listing to Bob Labs' gateway and configure the customer usage and billing workflow.
 
 The current weight formula uses verified TensorCash work and the reported invalid-work rate. Bob Labs' report schema includes inference metrics such as successful and failed requests, time to first token, and tokens per second. Using those metrics for Bittensor rewards would be a separate scoring decision.
 
@@ -53,7 +53,7 @@ uv run gpu-subnet-validate --format bob-v1 \
 
 Use `--report "$REPORT_PATH"` in place of `--capture` if you have the signed envelope JSON. Historical replay uses the recorded scoring window. Pass `--validator-hotkey "$VALIDATOR_HOTKEY_SS58"` to mirror the chain planner's exclusion of the selected validator.
 
-### Preview Bittensor weights
+### Plan Bittensor weights
 
 Set `BITTENSOR_NETWORK` to the intended chain name or WebSocket URL. Set `REPORT_MAX_AGE_SECONDS` to the maximum age you will accept between the signed window end and the local clock. The planner rejects timestamps in the future. Use the wallet and hotkey names of a registered validator with a permit.
 
@@ -66,7 +66,29 @@ uv run --extra chain gpu-subnet-chain \
   --wallet "$VALIDATOR_WALLET" --hotkey "$VALIDATOR_HOTKEY"
 ```
 
-`bob-weights` uses the roster at the current best block and pins the read to that block hash. It excludes the selected validator as well as the subnet owner and outputs an unsigned plan. Use `--report` for a signed envelope JSON and `--version-key` when the subnet requires a version key above the default of `0`. Bob Labs submission and automated polling are pending.
+`bob-weights` uses the roster at the current best block and pins the read to that block hash. It excludes the selected validator as well as the subnet owner and outputs an unsigned plan by default. Use `--report` for a signed envelope JSON and `--version-key` when the subnet requires a version key above the default of `0`.
+
+The report attributes work to a hotkey over the whole window. The validator follows Bob Labs' reference policy and scores each hotkey against its current registration. If the same hotkey re-registers during the window, its aggregate may still include work from its previous registration. Confirm the pool's treatment of those totals before the pilot.
+
+### Poll for new reports
+
+`bob-loop` takes the same scores origin and bearer credential as `capture`. It reads the subnet's actual tempo, weight rate limit, and last validator update to determine when to poll. The example runs one read-only poll and prints a JSON line with the result. Omit `--max-polls` to keep polling. `--timeout` sets the scores HTTP timeout in seconds.
+
+```sh
+uv run --extra chain gpu-subnet-chain \
+  --network "$BITTENSOR_NETWORK" --netuid "$SUBNET_NETUID" bob-loop \
+  --api-base "$API_BASE" --pool-public-key "$gpu_subnet_dir/pool-public-key.hex" \
+  --window-seconds 86400 --max-report-age-seconds "$REPORT_MAX_AGE_SECONDS" \
+  --wallet "$VALIDATOR_WALLET" --hotkey "$VALIDATOR_HOTKEY" --max-polls 1
+```
+
+Run one polling process per validator hotkey. The loop skips cached or older windows, stale or future reports, and windows with no eligible work. It stops on a failed or ambiguous submission and refuses to sign while an earlier attempt still needs reconciliation. Review the receipt and reconcile the earlier attempt before trying again. The loop does not retry weight submissions automatically.
+
+### Enable Bob Labs weight submission
+
+Both `bob-weights` and `bob-loop` require explicit `--submit --genesis-hash "$CHAIN_GENESIS_HASH"` to sign and broadcast. The genesis hash is the independently confirmed `0x`-prefixed hash of the target chain. Use the same private submission journal for both commands. Add `--journal /path/to/submissions.sqlite3` when using a custom location and pass the same path to `history` and `reconcile`.
+
+The journal records signed Unix-second windows separately from prototype block windows and migrates existing journals in place. A reserved or completed timestamp window prevents another submission for the same end timestamp even if the pool reissues the report with a different digest. Both formats share the chain-and-hotkey lock for signing and nonce use. The validator vetoes a send if a target registration, the subnet owner, or the target weights change after planning. Retries require a manual submission after reconciliation proves that the earlier attempt can be retried.
 
 ## Miner setup
 
@@ -78,9 +100,9 @@ The join token opens the pool connection. The per-worker bind token links that w
 
 - Get the scores base URL and bearer token, the pinned public key and its rotation procedure, and a representative signed scores fixture with its verification key. Confirm how the pool issues corrected reports and represents an empty window.
 - Get the pool WebSocket URL and join token, the release-matched miner installer and bind tool, and the reference validator and owner bootstrap for review. Keep vendor materials and all real credentials, captures, wallet files, and submission journals outside the repository.
-- Agree on the chain, subnet number, signing-key scope, acceptable report age, cadence, and scoring policy. The signed Bob Labs report includes a netuid and a timestamp window. Establish how the signing key is scoped to the intended chain and how the report window is aligned with finalized registrations, including work from a hotkey that re-registers during a window.
+- Agree on the chain, subnet number, signing-key scope, acceptable report age, and scoring policy. The signed Bob Labs report includes a netuid and a timestamp window. Confirm which chain each signing key covers and whether the pool's per-hotkey window totals carry work across re-registration. The advertised 60-second cache and 24-hour scoring window describe separate aspects of the feed. Choose a maximum report age that fits the pool's actual report timing.
 - Review Bob Labs' suggested starting settings of a 360-block tempo, at least 24 hours of immunity, up to 256 UIDs, and commit-reveal initially off. Check the subnet's weight rate limit and minimum destinations against the planned validator cadence and pilot roster.
-- Before Bob Labs submissions, extend the submission journal to order and deduplicate the signed timestamp windows even when a report is reissued with a different digest. Confirm retry rules, subnet weight settings, and operator procedures before a separately authorized pilot.
+- Confirm the operator procedures for a first submission, reconciliation, and the end-to-end verification of intended weights. Confirm the customer listing's routing, usage records, and supported request behavior with Bob Labs before offering paid inference.
 
 ## Run the offline prototype example
 
@@ -140,7 +162,7 @@ Before broadcasting, the validator commits the signed transaction hash, nonce, w
 
 The finalization watch has a 180-second deadline after the journal records the attempt. A timeout returns `submission_unconfirmed`. If the watch stops and the transaction's fate is unknown, the journal blocks further signing for that chain and hotkey across subnets. Reconcile the earlier attempt to establish inclusion or expiration. A confirmed rejection also clears the signing block.
 
-`history` lists transaction hashes and statuses offline. `reconcile` reads finalized chain state and saves the result privately. An `inclusion_verified` status records a match in a finalized block while dispatch or the follow-up audit is still open. Use `--journal` on all three commands if you store the journal elsewhere.
+`history` lists transaction hashes and statuses offline. `reconcile` reads finalized chain state and saves the result privately. An `inclusion_verified` status records a match in a finalized block while dispatch or the follow-up audit is still open. Use the same `--journal` path on the submission and recovery commands if you store the journal elsewhere.
 
 `reconcile` prints the saved readback as JSON. Exit code `0` means verified weight application, including a verified reveal. Exit code `1` means the attempt is awaiting finality, has verified inclusion with an audit still pending, or has a commitment still queued. Exit code `2` means the result needs attention, including a mismatch, unconfirmed evidence, dispatch failure, expiration, or a command error.
 

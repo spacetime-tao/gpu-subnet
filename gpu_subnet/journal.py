@@ -25,11 +25,21 @@ class JournalError(ValueError):
     """The journal could not safely record or recover a submission."""
 
 
+class WindowAlreadyAttempted(JournalError):
+    """Polling can skip an older window or one that already succeeded."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 class SubmissionJournal:
     def __init__(self, path: Path):
         self.path = path.expanduser().absolute()
         self._device, self._inode = self._prepare_file()
         with self._connection() as connection:
+            # Serialize the schema check and migration across journal openers.
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS attempts (
                     extrinsic_hash TEXT PRIMARY KEY,
@@ -37,8 +47,10 @@ class SubmissionJournal:
                     netuid INTEGER NOT NULL,
                     mechid INTEGER NOT NULL,
                     validator_hotkey TEXT NOT NULL,
-                    start_block INTEGER NOT NULL,
-                    end_block INTEGER NOT NULL,
+                    window_kind TEXT NOT NULL DEFAULT 'block'
+                        CHECK (window_kind IN ('block', 'timestamp')),
+                    window_start INTEGER NOT NULL,
+                    window_end INTEGER NOT NULL,
                     broadcast_head_block INTEGER NOT NULL,
                     attempt_json TEXT NOT NULL,
                     receipt_json TEXT,
@@ -47,9 +59,18 @@ class SubmissionJournal:
                     readback_status TEXT
                 )
             """)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
+            if "window_kind" not in columns:
+                connection.execute("ALTER TABLE attempts RENAME COLUMN start_block TO window_start")
+                connection.execute("ALTER TABLE attempts RENAME COLUMN end_block TO window_end")
+                connection.execute("""
+                    ALTER TABLE attempts ADD COLUMN window_kind TEXT NOT NULL DEFAULT 'block'
+                        CHECK (window_kind IN ('block', 'timestamp'))
+                """)
+                connection.execute("DROP INDEX IF EXISTS attempts_window")
             connection.execute("""
                 CREATE INDEX IF NOT EXISTS attempts_window
-                ON attempts (genesis_hash, netuid, mechid, validator_hotkey, end_block)
+                ON attempts (genesis_hash, netuid, mechid, validator_hotkey, window_kind, window_end)
             """)
 
     def _prepare_file(self) -> tuple[int, int]:
@@ -84,9 +105,12 @@ class SubmissionJournal:
 
     @contextmanager
     def submission_slot(
-        self, *, genesis_hash: str, netuid: int, mechid: int, hotkey: str, end_block: int
+        self, *, genesis_hash: str, netuid: int, mechid: int, hotkey: str,
+        end_block: int | None = None, end_ts: int | None = None,
+        window_kind: str = "block", allow_retry: bool = True,
     ) -> Iterator[None]:
         """Keep signing and sending in one order across users of this journal."""
+        end = _window_end(window_kind, end_block, end_ts)
         try:
             import fcntl
         except ImportError as error:
@@ -113,18 +137,22 @@ class SubmissionJournal:
                 raise JournalError("could not acquire the private submission lock") from error
 
             with self._connection() as connection:
-                _check_window_available(connection, (genesis_hash, netuid, mechid, hotkey, end_block))
-                _check_nonce_available(connection, genesis_hash, hotkey)
+                window = (genesis_hash, netuid, mechid, hotkey, window_kind, end)
+                if not allow_retry:
+                    _check_nonce_available(connection, genesis_hash, hotkey)
+                _check_window_available(connection, window, allow_retry=allow_retry)
+                if allow_retry:
+                    _check_nonce_available(connection, genesis_hash, hotkey)
             yield
         finally:
             # Keep the lock file in place so contenders always open the same inode.
             os.close(descriptor)
 
-    def record_attempt(self, attempt: dict) -> None:
+    def record_attempt(self, attempt: dict, *, allow_retry: bool = True) -> None:
         """Reserve a scoring-window end and save the signed hash before sending."""
         fields = _attempt_fields(attempt)
-        extrinsic_hash, genesis, netuid, mechid, signer, _, end, _ = fields
-        window = (genesis, netuid, mechid, signer, end)
+        extrinsic_hash, genesis, netuid, mechid, signer, kind, _, end, _ = fields
+        window = (genesis, netuid, mechid, signer, kind, end)
         document = _json_record(attempt)
         with self._connection() as connection:
             # Hold the writer lock across the window checks and insert.
@@ -133,12 +161,12 @@ class SubmissionJournal:
                 "SELECT 1 FROM attempts WHERE extrinsic_hash = ?", (extrinsic_hash,)
             ).fetchone():
                 raise JournalError(f"signed transaction {extrinsic_hash} is already recorded")
-            _check_window_available(connection, window)
+            _check_window_available(connection, window, allow_retry=allow_retry)
             connection.execute("""
                 INSERT INTO attempts (
                     extrinsic_hash, genesis_hash, netuid, mechid, validator_hotkey,
-                    start_block, end_block, broadcast_head_block, attempt_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    window_kind, window_start, window_end, broadcast_head_block, attempt_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (*fields, document))
 
     def save_receipt(self, tx_hash: str, receipt: dict) -> None:
@@ -213,13 +241,20 @@ class SubmissionJournal:
             connection.row_factory = sqlite3.Row
             rows = connection.execute("""
                 SELECT extrinsic_hash, genesis_hash, netuid, mechid, validator_hotkey,
-                    start_block, end_block, broadcast_head_block, receipt_json, readback_status
+                    window_kind, window_start, window_end, broadcast_head_block,
+                    receipt_json, readback_status
                 FROM attempts WHERE (? IS NULL OR netuid = ?)
                 ORDER BY rowid DESC LIMIT ?
             """, (netuid, netuid, limit)).fetchall()
         attempts = []
         for row in rows:
             summary = dict(row)
+            start, end = summary.pop("window_start"), summary.pop("window_end")
+            if summary["window_kind"] == "timestamp":
+                summary.update(start_ts=start, end_ts=end)
+            else:
+                summary.pop("window_kind")
+                summary.update(start_block=start, end_block=end)
             saved = summary.pop("receipt_json")
             summary["receipt_status"] = None if saved is None else _receipt_status(saved)
             attempts.append(summary)
@@ -234,19 +269,61 @@ def _owner_only_file(metadata: os.stat_result) -> bool:
     )
 
 
-def _check_window_available(connection: sqlite3.Connection, window: tuple[str, int, int, str, int]) -> None:
+def _window_end(kind: str, end_block: int | None, end_ts: int | None) -> int:
+    try:
+        if kind == "block" and end_ts is None:
+            return _uint(end_block, 32, label="window end block")
+        if kind == "timestamp" and end_block is None:
+            # SQLite INTEGER is signed. This range includes all real Unix dates.
+            return _uint(end_ts, 63, label="window end timestamp")
+    except ReportError as error:
+        raise JournalError(str(error)) from error
+    raise JournalError("submission requires one scoring window end matching its kind")
+
+
+def _check_window_available(
+    connection: sqlite3.Connection, window: tuple[str, int, int, str, str, int], *, allow_retry: bool,
+) -> None:
     newer = connection.execute("""
-        SELECT end_block FROM attempts
+        SELECT window_end FROM attempts
         WHERE genesis_hash = ? AND netuid = ? AND mechid = ?
-          AND validator_hotkey = ? AND end_block > ?
-        ORDER BY end_block DESC LIMIT 1
+          AND validator_hotkey = ? AND window_kind = ? AND window_end > ?
+        ORDER BY window_end DESC LIMIT 1
     """, window).fetchone()
     if newer:
-        raise JournalError(f"scoring window ends before reserved window {newer[0]}")
+        message = f"scoring window ends before reserved window {newer[0]}"
+        if not allow_retry:
+            raise WindowAlreadyAttempted("older_window", message)
+        raise JournalError(message)
+
+    if not allow_retry:
+        previous = connection.execute("""
+            SELECT extrinsic_hash, receipt_json, receipt_success, readback_status FROM attempts
+            WHERE genesis_hash = ? AND netuid = ? AND mechid = ?
+              AND validator_hotkey = ? AND window_kind = ? AND window_end = ?
+            ORDER BY rowid DESC LIMIT 1
+        """, window).fetchone()
+        if previous is None:
+            return
+        tx_hash, receipt, receipt_success, readback_status = previous
+        completed_readback = readback_status in (*_APPLIED, "commit_pending")
+        completed_receipt = (
+            receipt_success
+            and readback_status in (None, "awaiting_finality", _INCLUSION_VERIFIED)
+            and _receipt_status(receipt) in ("weights_submitted", "commit_queued")
+        )
+        if completed_readback or completed_receipt:
+            raise WindowAlreadyAttempted(
+                "window_already_processed", f"scoring window was already processed by {tx_hash}",
+            )
+        raise JournalError(
+            f"scoring window has an earlier attempt {tx_hash}. Review it before retrying manually."
+        )
+
     blocked = connection.execute("""
         SELECT extrinsic_hash FROM attempts
         WHERE genesis_hash = ? AND netuid = ? AND mechid = ?
-          AND validator_hotkey = ? AND end_block = ?
+          AND validator_hotkey = ? AND window_kind = ? AND window_end = ?
           AND (receipt_success = 1 OR COALESCE(readback_status, '') NOT IN (?, ?))
         LIMIT 1
     """, (*window, *_RETRYABLE)).fetchone()
@@ -465,16 +542,24 @@ def _receipt_status(saved: str) -> str | None:
     return status if isinstance(status, str) else None
 
 
-def _attempt_fields(attempt: dict) -> tuple[str, str, int, int, str, int, int, int]:
+def _attempt_fields(attempt: dict) -> tuple[str, str, int, int, str, str, int, int, int]:
     try:
         extrinsic_hash = _chain_hash(attempt["extrinsic_hash"], label="transaction hash")
         genesis_hash = _chain_hash(attempt["genesis_hash"], label="genesis hash")
         netuid = _uint(attempt["netuid"], 16, label="subnet ID")
         mechid = _uint(attempt["mechid"], 16, label="mechanism ID")
         signer = _hotkey(attempt["validator_hotkey"])
-        start = _uint(attempt["start_block"], 32, label="window start")
-        end = _uint(attempt["end_block"], 32, label="window end")
-        _chain_hash(attempt["end_block_hash"], label="window end hash")
+        kind = attempt.get("window_kind", "block")
+        end = _window_end(kind, attempt.get("end_block"), attempt.get("end_ts"))
+        if kind == "block":
+            if "start_ts" in attempt or "end_ts" in attempt:
+                raise JournalError("block scoring windows cannot contain timestamps")
+            start = _uint(attempt["start_block"], 32, label="window start block")
+            _chain_hash(attempt["end_block_hash"], label="window end hash")
+        else:
+            if {"start_block", "end_block", "end_block_hash"} & attempt.keys():
+                raise JournalError("timestamp scoring windows cannot contain block anchors")
+            start = _uint(attempt["start_ts"], 63, label="window start timestamp")
         _uint(attempt["nonce"], 64, label="transaction nonce")
         digest = attempt["report_digest"]
         scan_start = _uint(attempt["scan_start_block"], 32, label="scan start")
@@ -485,11 +570,12 @@ def _attempt_fields(attempt: dict) -> tuple[str, str, int, int, str, int, int, i
     except (KeyError, TypeError, ReportError) as error:
         raise JournalError("submission attempt is missing valid transaction or window metadata") from error
     if (
-        netuid == 0 or end <= start or end > broadcast_head or scan_start > broadcast_head + 1
+        netuid == 0 or end <= start or (kind == "block" and end > broadcast_head)
+        or scan_start > broadcast_head + 1
         or period == 0 or not isinstance(digest, str)
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         or not isinstance(encoded_weights, dict) or not encoded_weights
         or not isinstance(targets, list) or not targets
     ):
         raise JournalError("submission attempt has invalid transaction or window metadata")
-    return extrinsic_hash, genesis_hash, netuid, mechid, signer, start, end, broadcast_head
+    return extrinsic_hash, genesis_hash, netuid, mechid, signer, kind, start, end, broadcast_head

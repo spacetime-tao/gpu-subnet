@@ -313,13 +313,18 @@ async def _check_weights(client, attempt, block_hash, index, validator_uid):
     roster = await read_roster(client, attempt["netuid"], block_hash=block_hash)
     if roster.snapshot.genesis_hash != attempt["genesis_hash"]:
         raise ChainError("weight readback roster is on a different chain")
+    timestamp_window = attempt.get("window_kind") == "timestamp"
+    if timestamp_window and roster.snapshot.owner_hotkey is None:
+        raise ChainError("weight readback roster does not identify the subnet owner")
     slots = {slot.uid: slot for slot in roster.snapshot.miners}
     validator = slots.get(validator_uid)
     changed = []
     for target in attempt["targets"]:
         slot = slots.get(target["uid"])
-        if slot is None or (slot.hotkey, slot.registered_at) != (
-            target["hotkey"], target["registered_at"]
+        if (
+            slot is None
+            or (slot.hotkey, slot.registered_at) != (target["hotkey"], target["registered_at"])
+            or (timestamp_window and slot.hotkey == roster.snapshot.owner_hotkey)
         ):
             changed.append(target["uid"])
 

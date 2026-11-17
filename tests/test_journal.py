@@ -1,3 +1,5 @@
+import json
+import sqlite3
 import stat
 import tempfile
 import unittest
@@ -5,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 
-from gpu_subnet.journal import JournalError, SubmissionJournal
+from gpu_subnet.journal import JournalError, SubmissionJournal, WindowAlreadyAttempted
 
 
 def attempt(tag: str, **changes) -> dict:
@@ -25,6 +27,15 @@ def attempt(tag: str, **changes) -> dict:
         "scan_start_block": 21,
         "broadcast_head_block": 22,
         "transaction_period_blocks": 8,
+    } | changes
+
+
+def timestamp_attempt(tag: str, **changes) -> dict:
+    record = attempt(tag)
+    for key in ("start_block", "end_block", "end_block_hash"):
+        del record[key]
+    return record | {
+        "window_kind": "timestamp", "start_ts": 1_700_000_000, "end_ts": 1_700_086_400,
     } | changes
 
 
@@ -69,6 +80,167 @@ class JournalTests(unittest.TestCase):
         self.journal.record_attempt(attempt("3", start_block=11, end_block=21))
         with self.assertRaisesRegex(JournalError, "already recorded"):
             self.journal.record_attempt(first)
+
+    def test_migrates_an_existing_block_journal_with_concurrent_openers(self):
+        legacy_path = self.path.with_name("pre-timestamp.sqlite3")
+        legacy_path.touch(mode=0o600)
+        legacy = attempt("1")
+        tx_hash = legacy["extrinsic_hash"]
+        receipt = {"status": "weights_submitted", "success": True}
+        readback = inclusion("weights_applied", 30)
+        with sqlite3.connect(legacy_path) as connection:
+            connection.executescript("""
+                CREATE TABLE attempts (
+                    extrinsic_hash TEXT PRIMARY KEY,
+                    genesis_hash TEXT NOT NULL,
+                    netuid INTEGER NOT NULL,
+                    mechid INTEGER NOT NULL,
+                    validator_hotkey TEXT NOT NULL,
+                    start_block INTEGER NOT NULL,
+                    end_block INTEGER NOT NULL,
+                    broadcast_head_block INTEGER NOT NULL,
+                    attempt_json TEXT NOT NULL,
+                    receipt_json TEXT,
+                    receipt_success INTEGER NOT NULL DEFAULT 0,
+                    readback_json TEXT,
+                    readback_status TEXT
+                );
+                CREATE INDEX attempts_window
+                ON attempts (genesis_hash, netuid, mechid, validator_hotkey, end_block);
+            """)
+            connection.execute("INSERT INTO attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+                tx_hash, legacy["genesis_hash"], legacy["netuid"], legacy["mechid"],
+                legacy["validator_hotkey"], legacy["start_block"], legacy["end_block"],
+                legacy["broadcast_head_block"], json.dumps(legacy), json.dumps(receipt), 1,
+                json.dumps(readback), readback["status"],
+            ))
+        ready = Barrier(2)
+
+        def reopen(_):
+            ready.wait(timeout=5)
+            return SubmissionJournal(legacy_path).get(tx_hash)
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            for entry in workers.map(reopen, range(2)):
+                self.assertEqual(entry, {
+                    "attempt": legacy | {"encoded_weights": {"3": 65_535}},
+                    "receipt": receipt, "readback": readback,
+                })
+        migrated = SubmissionJournal(legacy_path)
+        self.assertEqual(migrated.list_attempts()[0]["end_block"], 20)
+        self.assertNotIn("window_kind", migrated.list_attempts()[0])
+        with self.assertRaisesRegex(JournalError, "already reserved"):
+            migrated.record_attempt(attempt("2"))
+        migrated.record_attempt(timestamp_attempt("3"))
+
+    def test_timestamp_windows_are_ordered_separately_from_block_windows(self):
+        timestamp = timestamp_attempt("1")
+        self.journal.record_attempt(timestamp)
+        self.journal.record_attempt(attempt("2"))
+        reopened = SubmissionJournal(self.path)
+        with self.assertRaisesRegex(JournalError, "before reserved window 1700086400"):
+            reopened.record_attempt(timestamp_attempt("3", end_ts=timestamp["end_ts"] - 1))
+        with self.assertRaisesRegex(JournalError, "already reserved"):
+            reopened.record_attempt(timestamp_attempt("4", report_digest="e" * 64))
+        reopened.record_attempt(timestamp_attempt("5", netuid=2, end_ts=timestamp["end_ts"] - 1))
+        saved = reopened.get(timestamp["extrinsic_hash"])["attempt"]
+        self.assertEqual(saved, timestamp | {"encoded_weights": {"3": 65_535}})
+        summary = reopened.list_attempts(netuid=1)[1]
+        self.assertEqual(
+            (summary["window_kind"], summary["start_ts"], summary["end_ts"]),
+            ("timestamp", timestamp["start_ts"], timestamp["end_ts"]),
+        )
+        self.assertNotIn("start_block", summary)
+
+    def test_timestamp_poll_skips_only_older_or_completed_windows(self):
+        timestamp = timestamp_attempt("1")
+        tx_hash = timestamp["extrinsic_hash"]
+        self.journal.record_attempt(timestamp, allow_retry=False)
+        slot = {
+            "genesis_hash": timestamp["genesis_hash"], "netuid": 1, "mechid": 0,
+            "hotkey": "validator", "window_kind": "timestamp", "end_ts": timestamp["end_ts"],
+            "allow_retry": False,
+        }
+        with self.assertRaisesRegex(JournalError, "reconcile unresolved submission") as pending:
+            with self.journal.submission_slot(**slot):
+                self.fail("poll accepted a pending window")
+        self.assertNotIsInstance(pending.exception, WindowAlreadyAttempted)
+        self.journal.save_receipt(tx_hash, {
+            "status": "weights_submitted", "success": True,
+            "block_hash": "0x" + "d" * 64, "extrinsic_id": "22-0004",
+        })
+        with self.assertRaises(WindowAlreadyAttempted) as completed:
+            with self.journal.submission_slot(**slot):
+                self.fail("poll accepted a completed window")
+        self.assertEqual(completed.exception.reason, "window_already_processed")
+        corrected = timestamp_attempt("2", report_digest="e" * 64)
+        with self.assertRaises(WindowAlreadyAttempted):
+            self.journal.record_attempt(corrected, allow_retry=False)
+        with self.assertRaisesRegex(JournalError, "already reserved"):
+            self.journal.record_attempt(corrected)
+        with self.assertRaises(WindowAlreadyAttempted) as older:
+            with self.journal.submission_slot(**(slot | {"end_ts": timestamp["end_ts"] - 1})):
+                self.fail("poll accepted an older window")
+        self.assertEqual(older.exception.reason, "older_window")
+        self.journal.save_readback(tx_hash, {"status": "inclusion_unconfirmed", "inclusion_conflict": True})
+        with self.assertRaisesRegex(JournalError, "Review it before retrying manually") as conflict:
+            with self.journal.submission_slot(**slot):
+                self.fail("poll accepted a conflicting window")
+        self.assertNotIsInstance(conflict.exception, WindowAlreadyAttempted)
+
+    def test_timestamp_window_requires_explicit_command_for_definitive_retry(self):
+        timestamp = timestamp_attempt("1")
+        self.journal.record_attempt(timestamp)
+        self.journal.save_readback(
+            timestamp["extrinsic_hash"], inclusion("dispatch_failed", 23, extrinsic_id="22-0004"),
+        )
+        retry = timestamp_attempt("2", report_digest="e" * 64)
+        slot = {
+            "genesis_hash": timestamp["genesis_hash"], "netuid": 1, "mechid": 0,
+            "hotkey": "validator", "window_kind": "timestamp", "end_ts": timestamp["end_ts"],
+        }
+        reopened = SubmissionJournal(self.path)
+        with self.assertRaisesRegex(JournalError, "Review it before retrying manually") as stopped:
+            with reopened.submission_slot(**slot, allow_retry=False):
+                self.fail("poll accepted a failed window")
+        self.assertNotIsInstance(stopped.exception, WindowAlreadyAttempted)
+        with self.assertRaisesRegex(JournalError, "Review it before retrying manually"):
+            reopened.record_attempt(retry, allow_retry=False)
+        with reopened.submission_slot(**slot):
+            reopened.record_attempt(retry)
+        self.assertEqual(len(reopened.list_attempts()), 2)
+
+    def test_timestamp_window_can_be_retried_manually_after_complete_finalized_expiry(self):
+        timestamp = timestamp_attempt("1")
+        self.journal.record_attempt(timestamp)
+        tx_hash = timestamp["extrinsic_hash"]
+        self.journal.save_readback(tx_hash, {
+            "status": "expired_unseen", "finalized_block": 30,
+            "scan_start_block": 21, "scan_end_block": 30, "expiry_upper_bound": 30,
+        })
+        with self.journal.submission_slot(
+            genesis_hash=timestamp["genesis_hash"], netuid=1, mechid=0, hotkey="validator",
+            window_kind="timestamp", end_ts=timestamp["end_ts"],
+        ):
+            self.journal.record_attempt(timestamp_attempt("2"))
+
+    def test_timestamp_slot_shares_block_lock_and_unresolved_nonce(self):
+        timestamp = timestamp_attempt("1")
+        block_slot = {
+            "genesis_hash": timestamp["genesis_hash"], "netuid": 1, "mechid": 0,
+            "hotkey": "validator", "end_block": 20,
+        }
+        timestamp_slot = block_slot | {"window_kind": "timestamp", "end_ts": timestamp["end_ts"]}
+        del timestamp_slot["end_block"]
+        reopened = SubmissionJournal(self.path)
+        with self.journal.submission_slot(**block_slot):
+            with self.assertRaisesRegex(JournalError, "another weight submission is active"):
+                with reopened.submission_slot(**timestamp_slot):
+                    self.fail("another window kind acquired the signing lock")
+        self.journal.record_attempt(timestamp)
+        with self.assertRaisesRegex(JournalError, "reconcile unresolved submission"):
+            with reopened.submission_slot(**block_slot):
+                self.fail("block scoring ignored the timestamp attempt's unresolved nonce")
 
     def test_verified_failure_allows_retry_and_keeps_attempt_history(self):
         first, retry = attempt("1"), attempt("2", nonce=43)
