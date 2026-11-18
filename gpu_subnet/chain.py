@@ -10,7 +10,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
-from .bob_loop import run_bob_loop
+from .bob_loop import FAILED_SUBMISSION_STATUSES, run_bob_loop
 from .bob_scores import (
     DEFAULT_WINDOW_SECONDS,
     BobReport,
@@ -31,7 +31,6 @@ from .weights import MinerSlot, preview_weights
 _SDK_VERSION = "11.3.2"
 _DEFAULT_JOURNAL = Path.home() / ".local/state/gpu-subnet/submissions.sqlite3"
 _MECHID = 0
-_FAILED_SUBMISSIONS = {"submission_failed", "submission_unconfirmed", "submission_needs_review"}
 
 
 class BobReportAgeError(ChainError):
@@ -552,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
         if status in ("awaiting_finality", "inclusion_verified", "commit_pending"):
             return 1
         return 2
-    return 2 if status in _FAILED_SUBMISSIONS else 0
+    return 2 if status in FAILED_SUBMISSION_STATUSES else 0
 
 
 if __name__ == "__main__":

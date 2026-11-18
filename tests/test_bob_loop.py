@@ -141,6 +141,27 @@ class BobLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.run_report.assert_awaited_once()
                 self.emit.assert_called_once_with(failure)
 
+    async def test_malformed_receipt_is_rejected_before_emit(self):
+        for receipt in (None, {}, {"status": None}, {"status": ""}, {"status": ["preview_ready"]}):
+            with self.subTest(receipt=receipt):
+                self.run_report.reset_mock()
+                self.run_report.return_value = receipt
+
+                with self.assertRaisesRegex(ChainError, "polling receipt requires a nonempty string status"):
+                    await self.poll([100], [report(100_000)])
+
+                self.run_report.assert_awaited_once()
+                self.emit.assert_not_called()
+
+    async def test_unknown_receipt_status_is_rejected_before_emit(self):
+        self.run_report.return_value = {"status": "typo_in_status"}
+
+        with self.assertRaisesRegex(ChainError, "polling receipt has an unrecognized status"):
+            await self.poll([100], [report(100_000)])
+
+        self.run_report.assert_awaited_once()
+        self.emit.assert_not_called()
+
     async def test_fetch_exception_ends_loop_without_retry(self):
         error = OSError("scores endpoint unavailable")
 

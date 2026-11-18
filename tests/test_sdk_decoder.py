@@ -7,11 +7,13 @@ from hashlib import blake2b
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from gpu_subnet.journal import JournalError, SubmissionJournal
 from gpu_subnet.readback import reconcile_submission
-from gpu_subnet.roster import read_roster
+from gpu_subnet.roster import ChainError, read_roster
+from gpu_subnet.submission import submit_weights
 from gpu_subnet.uid_guard import make_guarded_client
 
 
@@ -165,6 +167,57 @@ class SdkDecoderTests(unittest.IsolatedAsyncioTestCase):
             },
             "receipt": None,
         }
+
+    async def test_sdk_checks_guard_before_sending_to_rpc(self):
+        import bittensor as sdk
+        from bittensor._transport.contract import SignedExtrinsic
+
+        client = self.client("direct")
+        transport = client._substrate.raw
+        data = bytes.fromhex(self.vectors["extrinsic"][2:])
+        signer = SimpleNamespace(
+            ss58_address=HOTKEYS[0], public_key=bytes(32), crypto_type=1,
+            sign=Mock(side_effect=AssertionError("test uses a synthetic extrinsic")),
+        )
+        extrinsic = SignedExtrinsic(
+            data=data, extrinsic_hash="0x" + blake2b(data, digest_size=32).hexdigest(),
+            signer_address=signer.ss58_address, nonce=0,
+        )
+        intent = sdk.SetWeights(netuid=NETUID, mechid=MECHID, weights=ENCODED_WEIGHTS)
+        plan = SimpleNamespace(
+            ok=True, shielded=False, call=object(), extras={}, signer_address=signer.ss58_address,
+        )
+        before_broadcast = AsyncMock()
+        watch = MagicMock()
+        watch.__aiter__.return_value = [{"result": {"finalized": block_hash(INCLUSION)}}]
+        watch.unsubscribe = AsyncMock()
+
+        async def subscribe(method, params, unsubscribe):
+            before_broadcast.assert_awaited_once_with(extrinsic, signer.ss58_address)
+            self.assertEqual(method, "author_submitAndWatchExtrinsic")
+            self.assertEqual(params, [extrinsic.data_hex])
+            self.assertEqual(unsubscribe, "author_unwatchExtrinsic")
+            return watch
+
+        # Inject the plan and synthetic signed bytes, keeping SDK execution,
+        # guard dispatch, and watch handling on their normal path.
+        with (
+            patch.object(client, "query", return_value=0),
+            patch.object(client._executor, "plan", return_value=plan),
+            patch.object(transport, "create_signed_extrinsic", return_value=extrinsic),
+            patch.object(transport._session, "subscribe", side_effect=subscribe) as rpc_send,
+        ):
+            with self.assertRaisesRegex(ChainError, "requires an active guard"):
+                await client.execute(intent, signer, shielded=False)
+            rpc_send.assert_not_awaited()
+
+            receipt = await submit_weights(client, signer, intent, before_broadcast=before_broadcast)
+
+        rpc_send.assert_awaited_once()
+        watch.unsubscribe.assert_awaited_once()
+        signer.sign.assert_not_called()
+        self.assertEqual(receipt["status"], "weights_submitted")
+        self.assertEqual(receipt["block_hash"], block_hash(INCLUSION))
 
     async def test_decodes_extrinsic_events_stored_weights_and_roster(self):
         client = self.client("direct")

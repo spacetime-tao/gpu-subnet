@@ -13,6 +13,8 @@ _HANDLED = {
     "preview_ready", "no_eligible_work", "duplicate_window", "weights_submitted", "commit_queued",
 }
 _SKIPPED = {"stale_report", "future_report", "window_skipped"}
+FAILED_SUBMISSION_STATUSES = {"submission_failed", "submission_unconfirmed", "submission_needs_review"}
+_RECEIPT_STATUSES = _HANDLED | _SKIPPED | FAILED_SUBMISSION_STATUSES
 
 
 async def _timing(client, netuid: int, validator_hotkey: str | None) -> tuple[int, int, int]:
@@ -102,8 +104,9 @@ async def run_bob_loop(
             and (last_window_submitted or report.digest == last_handled.digest)
         )
         if older or repeated:
+            status = "duplicate_window"
             receipt = {
-                "status": "duplicate_window",
+                "status": status,
                 "reason": "older_window" if older else "window_already_processed",
                 "netuid": netuid,
                 "end_ts": report.end_ts,
@@ -111,12 +114,15 @@ async def run_bob_loop(
             }
         else:
             receipt = await run_report(report)
-            if receipt["status"] in _HANDLED:
+            status = receipt.get("status") if isinstance(receipt, dict) else None
+            if not isinstance(status, str) or not status:
+                raise ChainError("polling receipt requires a nonempty string status")
+            if status not in _RECEIPT_STATUSES:
+                raise ChainError("polling receipt has an unrecognized status")
+            if status in _HANDLED:
                 last_handled = report
-                last_window_submitted = receipt["status"] in ("weights_submitted", "commit_queued")
+                last_window_submitted = status in ("weights_submitted", "commit_queued")
         emit(receipt)
         polls += 1
-        if (
-            receipt["status"] not in _HANDLED and receipt["status"] not in _SKIPPED
-        ) or polls == max_polls:
+        if status in FAILED_SUBMISSION_STATUSES or polls == max_polls:
             return receipt

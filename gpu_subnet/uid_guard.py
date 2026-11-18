@@ -125,18 +125,19 @@ def make_guarded_client(
         ):
             # SDK 11.3.2 calls this with the signed extrinsic. Its next write
             # is raw.submit_extrinsic, which broadcasts without signing again.
-            check = self._before_weight_broadcast.get()
-            if check is not None:
-                try:
-                    await check(extrinsic, signer_address)
-                except BaseException:
-                    # A veto or cancellation here definitely precedes broadcast.
-                    abandoned = reservation
-                    if abandoned is None and reset_nonce_cache and extrinsic.nonce is not None:
-                        abandoned = (extrinsic.nonce, 1)
-                    if abandoned is not None:
-                        self.release_nonce_reservation(signer_address, *abandoned)
-                    raise
+            try:
+                check = self._before_weight_broadcast.get()
+                if check is None:
+                    raise ChainError("broadcast requires an active guard")
+                await check(extrinsic, signer_address)
+            except BaseException:
+                # A veto or cancellation here definitely precedes broadcast.
+                abandoned = reservation
+                if abandoned is None and reset_nonce_cache and extrinsic.nonce is not None:
+                    abandoned = (extrinsic.nonce, 1)
+                if abandoned is not None:
+                    self.release_nonce_reservation(signer_address, *abandoned)
+                raise
 
             return await super()._submit_and_report(
                 extrinsic,
@@ -165,8 +166,19 @@ def guard_broadcast(client, check: BroadcastCheck) -> Iterator[None]:
     if hook is None:
         raise ChainError("weight submission requires a client with a broadcast guard")
 
-    token = hook.set(check)
+    active = True
+
+    async def scoped_check(extrinsic, signer_address):
+        if not active:
+            raise ChainError("broadcast requires an active guard")
+        await check(extrinsic, signer_address)
+        if not active:
+            raise ChainError("broadcast requires an active guard")
+
+    # A child task keeps its copied ContextVar after this scope exits.
+    token = hook.set(scoped_check)
     try:
         yield
     finally:
+        active = False
         hook.reset(token)

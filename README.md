@@ -120,7 +120,7 @@ The receipt gives UID `7` relative work `700` and UID `12` relative work `300`. 
 uv run python -m unittest discover -s tests -v
 ```
 
-The offline SCALE decoder check covers the roster, direct weight writes, and timelocked commitments and reveals. It uses historical Bittensor runtime metadata and synthetic payloads with network connections blocked.
+The offline SDK checks cover the broadcast guard, roster, direct weight writes, and timelocked commitments and reveals. They use historical Bittensor runtime metadata, synthetic payloads, and a mocked RPC transport with network connections blocked.
 
 ```sh
 GPU_SUBNET_REQUIRE_SDK_CHECK=1 uv run --extra chain \

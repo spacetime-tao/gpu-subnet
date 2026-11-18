@@ -52,10 +52,11 @@ class BroadcastGuardTests(unittest.IsolatedAsyncioTestCase):
         with guard_broadcast(self.client, check):
             result = await self.transport._submit_and_report(self.extrinsic, **self.options)
         self.assertEqual(result, "mock receipt")
-        await self.transport._submit_and_report(self.extrinsic, **self.options)
+        with self.assertRaisesRegex(ChainError, "requires an active guard"):
+            await self.transport._submit_and_report(self.extrinsic, **self.options)
         self.assertEqual(
             self.transport.events,
-            [("check", "validator"), ("broadcast", 24, self.options), ("broadcast", 24, self.options)],
+            [("check", "validator"), ("broadcast", 24, self.options), ("release", "validator", 24, 1)],
         )
         self.assertEqual(self.transport.options, {
             "fallback_endpoints": ["fallback"], "archive_endpoints": ["archive"]
@@ -87,7 +88,7 @@ class BroadcastGuardTests(unittest.IsolatedAsyncioTestCase):
             await self.transport._submit_and_report(self.extrinsic, **options)
         self.assertEqual(self.transport.events, [("release", "validator", 23, 2)])
 
-    async def test_guard_scope_does_not_affect_concurrent_task(self):
+    async def test_concurrent_task_outside_scope_cannot_broadcast(self):
         ready = asyncio.Event()
 
         async def unrelated():
@@ -100,7 +101,26 @@ class BroadcastGuardTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(unrelated())
         with guard_broadcast(self.client, check):
             ready.set()
-            self.assertEqual(await task, "mock receipt")
+            with self.assertRaisesRegex(ChainError, "requires an active guard"):
+                await task
+        self.assertEqual(self.transport.events, [("release", "validator", 24, 1)])
+
+    async def test_inherited_guard_expires_with_scope(self):
+        ready = asyncio.Event()
+
+        async def send():
+            await ready.wait()
+            return await self.transport._submit_and_report(self.extrinsic, **self.options)
+
+        async def check(extrinsic, signer_address):
+            self.fail("the expired guard's check ran")
+
+        with guard_broadcast(self.client, check):
+            task = asyncio.create_task(send())
+        ready.set()
+        with self.assertRaisesRegex(ChainError, "requires an active guard"):
+            await task
+        self.assertEqual(self.transport.events, [("release", "validator", 24, 1)])
 
     def test_unguarded_client_is_rejected(self):
         with self.assertRaises(ChainError), guard_broadcast(SimpleNamespace(), lambda *_: None):
